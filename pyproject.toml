@@ -1,0 +1,47 @@
+[project]
+name = "packageproof-pro"
+version = "0.1.0"
+description = "Paid OKX.AI A2MCP dependency firewall for npm and PyPI packages."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "e2b>=2.0.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "okxweb3-app-x402[evm]>=0.1.1,<0.2.0",
+    "openai>=1.90.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.8.0",
+    "uvicorn[standard]>=0.34.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.12.0",
+]
+
+[project.scripts]
+packageproof = "packageproof.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/packageproof"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from packageproof.core.config import Settings
+from packageproof.models.schemas import AnalyzePackageRequest, RegistryResult
+
+
+class RegistryClient:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def inspect(self, request: AnalyzePackageRequest) -> RegistryResult:
+        if request.ecosystem == "npm":
+            result = await self._inspect_npm(request)
+        else:
+            result = await self._inspect_pypi(request)
+
+        if result.exists and result.resolved_version:
+            result.advisories = await self._query_osv(request, result.resolved_version)
+        return result
+
+    async def _inspect_npm(self, request: AnalyzePackageRequest) -> RegistryResult:
+        encoded = quote(request.package, safe="@")
+        url = f"https://registry.npmjs.org/{encoded}"
+        result = RegistryResult(
+            ecosystem=request.ecosystem,
+            package=request.package,
+            requested_version=request.version,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+                response = await client.get(url)
+                if response.status_code == 404:
+                    result.errors.append("package not found in npm registry")
+                    return result
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            result.errors.append(f"npm registry lookup failed: {exc}")
+            return result
+
+        versions: dict[str, Any] = data.get("versions", {})
+        resolved = request.version
+        if request.version == "latest":
+            resolved = data.get("dist-tags", {}).get("latest", "")
+        version_info = versions.get(resolved, {})
+        result.exists = bool(version_info)
+        result.resolved_version = resolved or None
+        result.source_url = version_info.get("dist", {}).get("tarball")
+        result.metadata = {
+            "name": data.get("name"),
+            "description": data.get("description"),
+            "dist_tags": data.get("dist-tags", {}),
+            "created": data.get("time", {}).get("created"),
+            "modified": data.get("time", {}).get("modified"),
+            "version_time": data.get("time", {}).get(resolved),
+            "maintainers": data.get("maintainers", []),
+            "repository": data.get("repository"),
+            "license": data.get("license") or version_info.get("license"),
+            "scripts": version_info.get("scripts", {}),
+            "dependencies": version_info.get("dependencies", {}),
+            "dev_dependencies": version_info.get("devDependencies", {}),
+            "homepage": data.get("homepage") or version_info.get("homepage"),
+            "bugs": data.get("bugs") or version_info.get("bugs"),
+        }
+        if not result.exists:
+            result.errors.append(f"version {request.version} not found in npm registry")
+        return result
+
+    async def _inspect_pypi(self, request: AnalyzePackageRequest) -> RegistryResult:
+        url = f"https://pypi.org/pypi/{quote(request.package)}/json"
+        result = RegistryResult(
+            ecosystem=request.ecosystem,
+            package=request.package,
+            requested_version=request.version,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+                response = await client.get(url)
+                if response.status_code == 404:
+                    result.errors.append("package not found in PyPI")
+                    return result
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            result.errors.append(f"PyPI lookup failed: {exc}")
+            return result
+
+        info = data.get("info", {})
+        resolved = info.get("version") if request.version == "latest" else request.version
+        releases = data.get("releases", {})
+        files = releases.get(resolved, [])
+        result.exists = bool(files) or request.version == "latest"
+        result.resolved_version = resolved
+        result.source_url = self._best_pypi_source(files)
+        result.metadata = {
+            "name": info.get("name"),
+            "summary": info.get("summary"),
+            "version": info.get("version"),
+            "author": info.get("author"),
+            "maintainer": info.get("maintainer"),
+            "home_page": info.get("home_page"),
+            "project_urls": info.get("project_urls"),
+            "license": info.get("license"),
+            "requires_dist": info.get("requires_dist"),
+            "classifiers": info.get("classifiers"),
+            "release_files": [
+                {
+                    "filename": item.get("filename"),
+                    "packagetype": item.get("packagetype"),
+                    "upload_time_iso_8601": item.get("upload_time_iso_8601"),
+                    "size": item.get("size"),
+                }
+                for item in files
+            ],
+        }
+        if not result.exists:
+            result.errors.append(f"version {request.version} not found in PyPI")
+        return result
+
+    async def _query_osv(
+        self,
+        request: AnalyzePackageRequest,
+        resolved_version: str,
+    ) -> list[dict[str, Any]]:
+        ecosystem = "PyPI" if request.ecosystem == "pypi" else "npm"
+        payload = {
+            "package": {"name": request.package, "ecosystem": ecosystem},
+            "version": resolved_version,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
+                response = await client.post("https://api.osv.dev/v1/query", json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            return [{"source": "osv", "error": str(exc)}]
+
+        advisories = []
+        for vuln in data.get("vulns", []):
+            vuln_id = str(vuln.get("id", ""))
+            if vuln_id.startswith("MAL-") or "malicious" in str(vuln).lower():
+                advisory_type = "malicious"
+            else:
+                advisory_type = "vulnerability"
+            advisories.append(
+                {
+                    "source": "osv",
+                    "id": vuln_id,
+                    "type": advisory_type,
+                    "summary": vuln.get("summary"),
+                    "aliases": vuln.get("aliases", []),
+                }
+            )
+        return advisories
+
+    @staticmethod
+    def _best_pypi_source(files: list[dict[str, Any]]) -> str | None:
+        for preferred in ("sdist", "bdist_wheel"):
+            for item in files:
+                if item.get("packagetype") == preferred:
+                    return item.get("url")
+        return files[0].get("url") if files else None
