@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -7,6 +8,7 @@ import httpx
 
 from packageproof.core.config import Settings
 from packageproof.models.schemas import AnalyzePackageRequest, RegistryResult
+from packageproof.services.name_attack import NameAttackDetector
 
 
 class RegistryClient:
@@ -21,6 +23,8 @@ class RegistryClient:
 
         if result.exists and result.resolved_version:
             result.advisories = await self._query_osv(request, result.resolved_version)
+        result.metadata["reputation"] = self._reputation_signals(result)
+        result.metadata["name_attack"] = NameAttackDetector().analyze(request, result)
         return result
 
     async def _inspect_npm(self, request: AnalyzePackageRequest) -> RegistryResult:
@@ -64,8 +68,15 @@ class RegistryClient:
             "scripts": version_info.get("scripts", {}),
             "dependencies": version_info.get("dependencies", {}),
             "dev_dependencies": version_info.get("devDependencies", {}),
+            "peer_dependencies": version_info.get("peerDependencies", {}),
+            "bin": version_info.get("bin"),
             "homepage": data.get("homepage") or version_info.get("homepage"),
             "bugs": data.get("bugs") or version_info.get("bugs"),
+            "dist": {
+                "integrity": version_info.get("dist", {}).get("integrity"),
+                "shasum": version_info.get("dist", {}).get("shasum"),
+                "unpacked_size": version_info.get("dist", {}).get("unpackedSize"),
+            },
         }
         if not result.exists:
             result.errors.append(f"version {request.version} not found in npm registry")
@@ -117,6 +128,7 @@ class RegistryClient:
                 }
                 for item in files
             ],
+            "version_upload_time": self._first_upload_time(files),
         }
         if not result.exists:
             result.errors.append(f"version {request.version} not found in PyPI")
@@ -165,3 +177,86 @@ class RegistryClient:
                 if item.get("packagetype") == preferred:
                     return item.get("url")
         return files[0].get("url") if files else None
+
+    @staticmethod
+    def _first_upload_time(files: list[dict[str, Any]]) -> str | None:
+        times = [
+            item.get("upload_time_iso_8601") or item.get("upload_time")
+            for item in files
+            if item.get("upload_time_iso_8601") or item.get("upload_time")
+        ]
+        return sorted(times)[0] if times else None
+
+    def _reputation_signals(self, result: RegistryResult) -> dict[str, Any]:
+        signals: list[dict[str, str]] = []
+        metadata = result.metadata
+
+        package_age_days = self._age_days(metadata.get("created"))
+        version_time = metadata.get("version_time") or metadata.get("version_upload_time")
+        version_age_days = self._age_days(version_time)
+        maintainer_count = len(metadata.get("maintainers") or [])
+        dependency_count = len(metadata.get("dependencies") or {}) + len(
+            metadata.get("requires_dist") or []
+        )
+
+        if package_age_days is not None and package_age_days < 14:
+            signals.append(
+                {
+                    "type": "new_package",
+                    "severity": "medium",
+                    "detail": f"Package was first published {package_age_days} days ago",
+                }
+            )
+        if version_age_days is not None and version_age_days < 3:
+            signals.append(
+                {
+                    "type": "fresh_release",
+                    "severity": "low",
+                    "detail": f"Analyzed version was published {version_age_days} days ago",
+                }
+            )
+        if not metadata.get("repository") and not metadata.get("project_urls"):
+            signals.append(
+                {
+                    "type": "missing_source_repository",
+                    "severity": "low",
+                    "detail": "No source repository metadata found",
+                }
+            )
+        if result.ecosystem == "npm" and maintainer_count == 0:
+            signals.append(
+                {
+                    "type": "missing_maintainer_metadata",
+                    "severity": "low",
+                    "detail": "No npm maintainer metadata found",
+                }
+            )
+        if dependency_count >= 50:
+            signals.append(
+                {
+                    "type": "large_dependency_surface",
+                    "severity": "low",
+                    "detail": f"Package declares {dependency_count} dependency entries",
+                }
+            )
+
+        return {
+            "package_age_days": package_age_days,
+            "version_age_days": version_age_days,
+            "maintainer_count": maintainer_count,
+            "dependency_count": dependency_count,
+            "signals": signals,
+        }
+
+    @staticmethod
+    def _age_days(value: str | None) -> int | None:
+        if not value:
+            return None
+        normalized = value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return max((datetime.now(UTC) - parsed).days, 0)

@@ -25,6 +25,22 @@ class ScoreEngine:
         if registry_errors:
             score += 25
 
+        registry_metadata = evidence.registry.get("metadata", {})
+        reputation = registry_metadata.get("reputation", {})
+        for signal in reputation.get("signals", []):
+            score += self._signal_weight(signal.get("severity", "low"), default=5)
+            attack_types.add(str(signal.get("type")))
+
+        name_attack = registry_metadata.get("name_attack", {})
+        for signal in name_attack.get("signals", []):
+            score += self._signal_weight(signal.get("severity", "medium"), default=18)
+            attack_types.add(str(signal.get("type")))
+            alternative = signal.get("safer_alternative")
+            if alternative:
+                safer_alternatives.add(str(alternative))
+        for alternative in name_attack.get("safer_alternatives", []):
+            safer_alternatives.add(str(alternative))
+
         advisories = evidence.known_bad
         if advisories:
             malicious = [item for item in advisories if item.get("type") == "malicious"]
@@ -54,12 +70,6 @@ class ScoreEngine:
             score += 35 if chain.get("severity") == "critical" else 15
             attack_types.add(str(chain.get("type")))
 
-        typo_alternative = self._known_typo_alternative(request.package)
-        if typo_alternative:
-            score += 35
-            attack_types.add("typosquatting")
-            safer_alternatives.add(typo_alternative)
-
         if evidence.sandbox.get("error"):
             score += 5
 
@@ -87,16 +97,8 @@ class ScoreEngine:
         )
 
     @staticmethod
-    def _known_typo_alternative(package_name: str) -> str | None:
-        known = {
-            "browserlist": "browserslist",
-            "reqeusts": "requests",
-            "requestes": "requests",
-            "lodahs": "lodash",
-            "djagno": "django",
-            "fast-api": "fastapi",
-        }
-        return known.get(package_name.lower())
+    def _signal_weight(severity: str, default: int) -> int:
+        return {"critical": 35, "high": 35, "medium": 20, "low": 6}.get(severity, default)
 
     @staticmethod
     def _summary(

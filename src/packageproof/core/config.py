@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     e2b_api_key: str = ""
     enable_e2b: bool = False
+    e2b_allow_internet_access: bool = True
+    e2b_template: str | None = None
     e2b_timeout_seconds: int = Field(default=90, ge=10, le=300)
 
     openrouter_api_key: str = ""

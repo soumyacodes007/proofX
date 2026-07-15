@@ -45,7 +45,11 @@ class PackageAnalyzer:
             sandbox=sandbox.get("sandbox", {}),
             network=sandbox.get("network", {}),
             filesystem=sandbox.get("filesystem", {}),
-            behavior_chain=sandbox.get("behavior_chain", []) + static.get("behavior_chain", []),
+            behavior_chain=(
+                sandbox.get("behavior_chain", [])
+                + static.get("behavior_chain", [])
+                + static.get("install_script_risks", [])
+            ),
         )
 
         score_result = ScoreEngine().score(request, evidence)

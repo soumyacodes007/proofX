@@ -2,7 +2,7 @@
 
 PackageProof Pro is a paid OKX.AI A2MCP dependency firewall for npm and PyPI package checks.
 
-## Phase 1
+## Phase 1 and 2
 
 This repository currently implements:
 
@@ -12,7 +12,10 @@ This repository currently implements:
 - `GET /v1/reports/{report_id}`
 - SQLite report persistence and 24 hour cache reuse
 - npm, PyPI, and OSV registry intelligence
-- lightweight source archive static scanning
+- registry reputation signals for package age, release age, source metadata, maintainers, and dependency surface
+- typosquat, slopsquat, and dependency-confusion name analysis
+- source archive static scanning for install hooks, startup hooks, secret references, process launch, network exfiltration, obfuscation, and wallet strings
+- behavior-chain extraction for install-time secret access and possible exfiltration
 - deterministic risk scoring and verdicts
 - optional E2B detonation when `E2B_API_KEY` is configured
 - optional OpenRouter analyst summary when `OPENROUTER_API_KEY` is configured

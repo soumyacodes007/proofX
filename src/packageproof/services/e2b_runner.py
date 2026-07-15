@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+import shlex
+from dataclasses import dataclass
 from typing import Any
 
 from packageproof.core.config import Settings
@@ -12,7 +15,37 @@ CANARY_FILES = {
     "/home/user/.ssh/id_rsa": "-----BEGIN OPENSSH PRIVATE KEY-----\npackageproof-canary\n",
     "/home/user/.aws/credentials": "[default]\naws_secret_access_key=packageproof-canary\n",
     "/home/user/.config/gcloud/application_default_credentials.json": '{"canary": true}',
+    "/home/user/.config/gh/hosts.yml": "github.com:\n  oauth_token: ghp_packageproof_canary\n",
 }
+
+SENSITIVE_PATH_FRAGMENTS = (
+    ".aws/credentials",
+    ".config/gcloud",
+    ".config/gh",
+    ".env",
+    ".npmrc",
+    ".pypirc",
+    ".ssh/id_rsa",
+)
+
+SUSPICIOUS_EXECUTABLES = (
+    "bash",
+    "curl",
+    "nc",
+    "node",
+    "python",
+    "python3",
+    "sh",
+    "wget",
+)
+
+
+@dataclass(frozen=True)
+class DetonationPlan:
+    package_spec: str
+    workdir: str
+    install_command: str
+    probe_command: str
 
 
 class E2BDetonator:
@@ -53,112 +86,370 @@ class E2BDetonator:
                 "behavior_chain": [],
             }
 
-        package_spec = request.package
-        if registry.resolved_version and registry.resolved_version != "latest":
-            package_spec = f"{request.package}=={registry.resolved_version}"
-            if request.ecosystem == "npm":
-                package_spec = f"{request.package}@{registry.resolved_version}"
-
+        plan = self.build_plan(request, registry)
+        sandbox = None
         try:
-            sandbox = Sandbox.create(timeout=self.settings.e2b_timeout_seconds)
-            setup = self._plant_canaries(sandbox)
-            install = self._install_package(sandbox, request.ecosystem, package_spec)
-            probe = self._probe_package(sandbox, request.ecosystem, request.package)
-            listing = sandbox.commands.run(
-                "find /home/user -maxdepth 3 -type f | sort",
-                timeout=self.settings.e2b_timeout_seconds,
+            sandbox_kwargs: dict[str, Any] = {
+                "timeout": self.settings.e2b_timeout_seconds,
+                "allow_internet_access": self.settings.e2b_allow_internet_access,
+                "metadata": {
+                    "service": "packageproof-pro",
+                    "ecosystem": request.ecosystem,
+                    "package": request.package,
+                },
+            }
+            if self.settings.e2b_template:
+                sandbox_kwargs["template"] = self.settings.e2b_template
+
+            sandbox = Sandbox.create(**sandbox_kwargs)
+            setup = self._run(sandbox, self._canary_script(), timeout=30)
+            strace_check = self._run(sandbox, "command -v strace || true", timeout=15)
+            strace_available = bool(self._stdout(strace_check).strip())
+
+            before = self._run(sandbox, self._snapshot_command(), timeout=30)
+            install = self._run_detonation_command(
+                sandbox=sandbox,
+                label="install",
+                command=plan.install_command,
+                strace_available=strace_available,
             )
-            try:
-                sandbox.kill()
-            except Exception:
-                pass
+            probe = self._run_detonation_command(
+                sandbox=sandbox,
+                label="probe",
+                command=plan.probe_command,
+                strace_available=strace_available,
+                timeout=45,
+            )
+            after = self._run(sandbox, self._snapshot_command(), timeout=30)
+            install_strace = self._read_file(sandbox, "/tmp/packageproof-install.strace")
+            probe_strace = self._read_file(sandbox, "/tmp/packageproof-probe.strace")
         except Exception as exc:
             return {
-                "sandbox": {"enabled": True, "error": str(exc)},
+                "sandbox": {
+                    "enabled": True,
+                    "package_spec": plan.package_spec,
+                    "error": str(exc),
+                },
                 "network": {},
                 "filesystem": {},
                 "behavior_chain": [],
             }
+        finally:
+            if sandbox is not None:
+                try:
+                    sandbox.kill()
+                except Exception:
+                    pass
 
-        combined_output = "\n".join(
-            [
-                str(getattr(install, "stdout", "")),
-                str(getattr(install, "stderr", "")),
-                str(getattr(probe, "stdout", "")),
-                str(getattr(probe, "stderr", "")),
-            ]
+        command_results = {
+            "setup": self._command_result(setup),
+            "strace_check": self._command_result(strace_check),
+            "install": self._command_result(install),
+            "probe": self._command_result(probe),
+        }
+        return self.extract_evidence(
+            plan=plan,
+            command_results=command_results,
+            before_snapshot=self._stdout(before),
+            after_snapshot=self._stdout(after),
+            strace_text="\n".join([install_strace, probe_strace]),
         )
-        canary_mentions = []
-        for path in CANARY_FILES:
-            filename = path.rsplit("/", 1)[-1]
-            if path in combined_output or filename in combined_output:
-                canary_mentions.append(path)
-        behavior_chain = []
-        if canary_mentions:
-            behavior_chain.append(
-                {
-                    "type": "sandbox_canary_secret_access",
-                    "severity": "critical",
-                    "events": canary_mentions,
-                }
+
+    def build_plan(
+        self,
+        request: AnalyzePackageRequest,
+        registry: RegistryResult,
+    ) -> DetonationPlan:
+        package_spec = request.package
+        if registry.resolved_version and registry.resolved_version != "latest":
+            if request.ecosystem == "npm":
+                package_spec = f"{request.package}@{registry.resolved_version}"
+            else:
+                package_spec = f"{request.package}=={registry.resolved_version}"
+
+        workdir = "/home/user/packageproof-work"
+        quoted_workdir = shlex.quote(workdir)
+        quoted_spec = shlex.quote(package_spec)
+        if request.ecosystem == "npm":
+            install_command = (
+                f"mkdir -p {quoted_workdir} && cd {quoted_workdir} && "
+                "npm init -y >/dev/null 2>&1 && "
+                f"npm install --foreground-scripts {quoted_spec}"
             )
+            probe_code = f"require({request.package!r})"
+            probe_command = (
+                f"cd {quoted_workdir} && "
+                f"node -e {shlex.quote(probe_code)}"
+            )
+        else:
+            module_name = request.package.replace("-", "_")
+            install_command = (
+                "python -m pip install --disable-pip-version-check "
+                f"--no-input {quoted_spec}"
+            )
+            probe_code = f"import importlib; importlib.import_module({module_name!r})"
+            probe_command = f"python -c {shlex.quote(probe_code)}"
+
+        return DetonationPlan(
+            package_spec=package_spec,
+            workdir=workdir,
+            install_command=install_command,
+            probe_command=probe_command,
+        )
+
+    def extract_evidence(
+        self,
+        *,
+        plan: DetonationPlan,
+        command_results: dict[str, dict[str, Any]],
+        before_snapshot: str,
+        after_snapshot: str,
+        strace_text: str,
+    ) -> dict[str, Any]:
+        combined_output = "\n".join(
+            str(result.get("stdout", "")) + "\n" + str(result.get("stderr", ""))
+            for result in command_results.values()
+        )
+        combined = "\n".join([combined_output, strace_text])
+        filesystem_diff = self._diff_snapshots(before_snapshot, after_snapshot)
+        canary_accesses = self._canary_accesses(combined)
+        network_events = self._network_events(combined)
+        exec_events = self._exec_events(strace_text)
+        sensitive_writes = self._sensitive_writes(filesystem_diff)
+        behavior_chain = self._behavior_chain(
+            canary_accesses=canary_accesses,
+            network_events=network_events,
+            exec_events=exec_events,
+            sensitive_writes=sensitive_writes,
+        )
 
         return {
             "sandbox": {
                 "enabled": True,
-                "setup": self._command_result(setup),
-                "install": self._command_result(install),
-                "probe": self._command_result(probe),
+                "package_spec": plan.package_spec,
+                "workdir": plan.workdir,
+                "commands": command_results,
+                "strace_available": bool(command_results["strace_check"]["stdout"].strip()),
             },
             "network": {
-                "note": (
-                    "Phase 1 captures command output; packet-level capture is planned "
-                    "for Phase 3"
-                ),
+                "events": network_events,
+                "cloud_metadata_attempts": [
+                    event
+                    for event in network_events
+                    if event.get("host") in {"169.254.169.254", "metadata.google.internal"}
+                ],
             },
             "filesystem": {
-                "canary_mentions": canary_mentions,
-                "home_files": str(getattr(listing, "stdout", ""))[:4000],
+                "canary_accesses": canary_accesses,
+                "added": filesystem_diff["added"][:100],
+                "modified": filesystem_diff["modified"][:100],
+                "deleted": filesystem_diff["deleted"][:100],
+                "sensitive_writes": sensitive_writes,
             },
             "behavior_chain": behavior_chain,
         }
 
+    def _run_detonation_command(
+        self,
+        *,
+        sandbox: Any,
+        label: str,
+        command: str,
+        strace_available: bool,
+        timeout: int | None = None,
+    ) -> Any:
+        timeout = timeout or self.settings.e2b_timeout_seconds
+        if not strace_available:
+            return self._run(sandbox, command, timeout=timeout)
+
+        output_path = f"/tmp/packageproof-{label}.strace"
+        traced_command = (
+            "strace -f -s 240 -yy "
+            "-e trace=execve,openat,connect,sendto "
+            f"-o {shlex.quote(output_path)} "
+            f"sh -lc {shlex.quote(command)}"
+        )
+        return self._run(sandbox, traced_command, timeout=timeout)
+
     @staticmethod
-    def _plant_canaries(sandbox: Any) -> Any:
-        commands = [
-            "mkdir -p /home/user/.ssh /home/user/.aws /home/user/.config/gcloud",
-            *[
-                f"cat > {path} <<'PACKAGEPROOF_CANARY'\n{content}\nPACKAGEPROOF_CANARY"
-                for path, content in CANARY_FILES.items()
-            ],
+    def _run(sandbox: Any, command: str, timeout: int) -> Any:
+        return sandbox.commands.run(command, timeout=timeout)
+
+    @staticmethod
+    def _read_file(sandbox: Any, path: str) -> str:
+        try:
+            return str(sandbox.files.read(path))
+        except Exception:
+            try:
+                result = sandbox.commands.run(f"cat {shlex.quote(path)} 2>/dev/null || true")
+                return str(getattr(result, "stdout", ""))
+            except Exception:
+                return ""
+
+    @staticmethod
+    def _canary_script() -> str:
+        lines = [
+            "set -eu",
+            (
+                "mkdir -p /home/user/.ssh /home/user/.aws "
+                "/home/user/.config/gcloud /home/user/.config/gh"
+            ),
         ]
-        return sandbox.commands.run(" && ".join(commands), timeout=30)
+        for path, content in CANARY_FILES.items():
+            lines.append(f"cat > {shlex.quote(path)} <<'PACKAGEPROOF_CANARY'")
+            lines.append(content.rstrip("\n"))
+            lines.append("PACKAGEPROOF_CANARY")
+        lines.append("chmod 600 /home/user/.ssh/id_rsa")
+        return "\n".join(lines)
 
-    def _install_package(self, sandbox: Any, ecosystem: str, package_spec: str) -> Any:
-        if ecosystem == "npm":
-            command = f"cd /home/user && npm init -y && npm install {package_spec}"
-        else:
-            command = f"python -m pip install --disable-pip-version-check {package_spec}"
-        return sandbox.commands.run(command, timeout=self.settings.e2b_timeout_seconds)
-
-    def _probe_package(self, sandbox: Any, ecosystem: str, package_name: str) -> Any:
-        if ecosystem == "npm":
-            module_name = package_name.split("/")[-1]
-            command = f"cd /home/user && node -e \"require('{module_name}')\""
-        else:
-            module_name = package_name.replace("-", "_")
-            command = (
-                "python - <<'PY'\n"
-                "import importlib\n"
-                f"importlib.import_module('{module_name}')\n"
-                "PY"
-            )
-        return sandbox.commands.run(command, timeout=30)
+    @staticmethod
+    def _snapshot_command() -> str:
+        return (
+            "find /home/user /tmp -xdev -type f "
+            "-printf '%p\\t%s\\t%T@\\n' 2>/dev/null | sort"
+        )
 
     @staticmethod
     def _command_result(result: Any) -> dict[str, Any]:
         return {
             "exit_code": getattr(result, "exit_code", None),
-            "stdout": str(getattr(result, "stdout", ""))[:4000],
-            "stderr": str(getattr(result, "stderr", ""))[:4000],
+            "stdout": str(getattr(result, "stdout", ""))[:8000],
+            "stderr": str(getattr(result, "stderr", ""))[:8000],
         }
+
+    @staticmethod
+    def _stdout(result: Any) -> str:
+        return str(getattr(result, "stdout", ""))
+
+    @staticmethod
+    def _parse_snapshot(snapshot: str) -> dict[str, tuple[str, str]]:
+        parsed: dict[str, tuple[str, str]] = {}
+        for line in snapshot.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            path, size, mtime = parts[0], parts[1], parts[2]
+            parsed[path] = (size, mtime)
+        return parsed
+
+    def _diff_snapshots(self, before_snapshot: str, after_snapshot: str) -> dict[str, list[str]]:
+        before = self._parse_snapshot(before_snapshot)
+        after = self._parse_snapshot(after_snapshot)
+        before_paths = set(before)
+        after_paths = set(after)
+        common = before_paths & after_paths
+        return {
+            "added": sorted(after_paths - before_paths),
+            "deleted": sorted(before_paths - after_paths),
+            "modified": sorted(path for path in common if before[path] != after[path]),
+        }
+
+    @staticmethod
+    def _canary_accesses(text: str) -> list[dict[str, str]]:
+        events = []
+        for path in CANARY_FILES:
+            filename = path.rsplit("/", 1)[-1]
+            if path in text or filename in text:
+                events.append({"path": path, "type": "read_or_reference"})
+        return events
+
+    @staticmethod
+    def _network_events(text: str) -> list[dict[str, str]]:
+        events: list[dict[str, str]] = []
+        seen: set[tuple[str, str | None]] = set()
+        ip_pattern = re.compile(
+            r"(?:inet_addr\(\"(?P<ip>\d+\.\d+\.\d+\.\d+)\"\).*?"
+            r"sin_port\(htons\((?P<port>\d+)\)\)|"
+            r"(?P<url>https?://[^\s'\"<>]+))",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in ip_pattern.finditer(text):
+            host = match.group("ip")
+            port = match.group("port")
+            url = match.group("url")
+            if url:
+                host = url.split("//", maxsplit=1)[-1].split("/", maxsplit=1)[0]
+                port = None
+            if not host:
+                continue
+            key = (host, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({"host": host, "port": port or "", "source": "strace_or_output"})
+
+        if "metadata.google.internal" in text:
+            events.append(
+                {"host": "metadata.google.internal", "port": "", "source": "output"}
+            )
+        return events[:100]
+
+    @staticmethod
+    def _exec_events(strace_text: str) -> list[dict[str, str]]:
+        events: list[dict[str, str]] = []
+        for match in re.finditer(r'execve\("(?P<path>[^"]+)"', strace_text):
+            path = match.group("path")
+            name = path.rsplit("/", 1)[-1]
+            if name in SUSPICIOUS_EXECUTABLES:
+                events.append({"path": path, "name": name})
+        return events[:100]
+
+    @staticmethod
+    def _sensitive_writes(filesystem_diff: dict[str, list[str]]) -> list[str]:
+        changed = filesystem_diff["added"] + filesystem_diff["modified"]
+        return [
+            path
+            for path in changed
+            if any(fragment in path for fragment in SENSITIVE_PATH_FRAGMENTS)
+        ][:100]
+
+    @staticmethod
+    def _behavior_chain(
+        *,
+        canary_accesses: list[dict[str, str]],
+        network_events: list[dict[str, str]],
+        exec_events: list[dict[str, str]],
+        sensitive_writes: list[str],
+    ) -> list[dict[str, Any]]:
+        chains: list[dict[str, Any]] = []
+        if canary_accesses:
+            chains.append(
+                {
+                    "type": "sandbox_canary_secret_access",
+                    "severity": "critical",
+                    "events": canary_accesses,
+                }
+            )
+        if network_events:
+            chains.append(
+                {
+                    "type": "sandbox_network_activity",
+                    "severity": "high",
+                    "events": network_events,
+                }
+            )
+        if canary_accesses and network_events:
+            chains.append(
+                {
+                    "type": "sandbox_possible_secret_exfiltration",
+                    "severity": "critical",
+                    "events": canary_accesses + network_events,
+                }
+            )
+        if exec_events:
+            chains.append(
+                {
+                    "type": "sandbox_process_execution",
+                    "severity": "high",
+                    "events": exec_events,
+                }
+            )
+        if sensitive_writes:
+            chains.append(
+                {
+                    "type": "sandbox_sensitive_file_write",
+                    "severity": "high",
+                    "events": sensitive_writes,
+                }
+            )
+        return chains
