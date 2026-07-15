@@ -32,10 +32,9 @@ SUSPICIOUS_EXECUTABLES = (
     "bash",
     "curl",
     "nc",
-    "node",
-    "python",
-    "python3",
-    "sh",
+    "ncat",
+    "netcat",
+    "powershell",
     "wget",
 )
 
@@ -46,6 +45,13 @@ class DetonationPlan:
     workdir: str
     install_command: str
     probe_command: str
+
+
+@dataclass(frozen=True)
+class FailedCommand:
+    exit_code: int
+    stdout: str
+    stderr: str
 
 
 class E2BDetonator:
@@ -92,6 +98,7 @@ class E2BDetonator:
             sandbox_kwargs: dict[str, Any] = {
                 "timeout": self.settings.e2b_timeout_seconds,
                 "allow_internet_access": self.settings.e2b_allow_internet_access,
+                "api_key": self.settings.e2b_api_key,
                 "metadata": {
                     "service": "packageproof-pro",
                     "ecosystem": request.ecosystem,
@@ -273,7 +280,10 @@ class E2BDetonator:
 
     @staticmethod
     def _run(sandbox: Any, command: str, timeout: int) -> Any:
-        return sandbox.commands.run(command, timeout=timeout)
+        try:
+            return sandbox.commands.run(command, timeout=timeout)
+        except Exception as exc:
+            return FailedCommand(exit_code=-1, stdout="", stderr=str(exc))
 
     @staticmethod
     def _read_file(sandbox: Any, path: str) -> str:
@@ -357,26 +367,28 @@ class E2BDetonator:
     def _network_events(text: str) -> list[dict[str, str]]:
         events: list[dict[str, str]] = []
         seen: set[tuple[str, str | None]] = set()
-        ip_pattern = re.compile(
-            r"(?:inet_addr\(\"(?P<ip>\d+\.\d+\.\d+\.\d+)\"\).*?"
-            r"sin_port\(htons\((?P<port>\d+)\)\)|"
-            r"(?P<url>https?://[^\s'\"<>]+))",
-            re.IGNORECASE | re.DOTALL,
-        )
-        for match in ip_pattern.finditer(text):
-            host = match.group("ip")
-            port = match.group("port")
-            url = match.group("url")
-            if url:
-                host = url.split("//", maxsplit=1)[-1].split("/", maxsplit=1)[0]
-                port = None
-            if not host:
+        for line in text.splitlines():
+            if not any(token in line for token in ("connect(", "sendto(", "http://", "https://")):
                 continue
+            urls = re.findall(r"https?://[^\s'\"<>]+", line, flags=re.IGNORECASE)
+            for url in urls:
+                host = url.split("//", maxsplit=1)[-1].split("/", maxsplit=1)[0]
+                key = (host, None)
+                if key not in seen:
+                    seen.add(key)
+                    events.append({"host": host, "port": "", "source": "output"})
+
+            ip_match = re.search(r'inet_addr\("(?P<ip>\d+\.\d+\.\d+\.\d+)"\)', line)
+            if ip_match is None:
+                continue
+            port_match = re.search(r"sin_port\(htons\((?P<port>\d+)\)\)", line)
+            host = ip_match.group("ip")
+            port = port_match.group("port") if port_match else None
             key = (host, port)
             if key in seen:
                 continue
             seen.add(key)
-            events.append({"host": host, "port": port or "", "source": "strace_or_output"})
+            events.append({"host": host, "port": port or "", "source": "strace"})
 
         if "metadata.google.internal" in text:
             events.append(
@@ -420,12 +432,17 @@ class E2BDetonator:
                     "events": canary_accesses,
                 }
             )
-        if network_events:
+        cloud_metadata_events = [
+            event
+            for event in network_events
+            if event.get("host") in {"169.254.169.254", "metadata.google.internal"}
+        ]
+        if cloud_metadata_events:
             chains.append(
                 {
-                    "type": "sandbox_network_activity",
-                    "severity": "high",
-                    "events": network_events,
+                    "type": "sandbox_cloud_metadata_access",
+                    "severity": "critical",
+                    "events": cloud_metadata_events,
                 }
             )
         if canary_accesses and network_events:

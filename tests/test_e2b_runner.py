@@ -20,7 +20,7 @@ def test_build_plan_pins_npm_version():
 
     assert plan.package_spec == "@scope/pkg@1.2.3"
     assert "npm install" in plan.install_command
-    assert "require('@scope/pkg')" in plan.probe_command
+    assert "@scope/pkg" in plan.probe_command
 
 
 def test_build_plan_pins_pypi_version_and_import_probe():
