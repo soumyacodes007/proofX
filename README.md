@@ -2,7 +2,7 @@
 
 PackageProof Pro is a paid OKX.AI A2MCP dependency firewall for npm and PyPI package checks.
 
-## Phase 1 through 3
+## Phase 1 through 5
 
 This repository currently implements:
 
@@ -20,7 +20,15 @@ This repository currently implements:
 - E2B filesystem before/after diff and sensitive-write detection
 - E2B `strace` capture when available for `execve`, `openat`, `connect`, and `sendto`
 - sandbox evidence extraction for canary access, outbound network activity, process execution, and possible secret exfiltration
-- deterministic risk scoring and verdicts
+- deterministic weighted rule engine with score contribution breakdowns
+- verdicts are derived from evidence only; the AI summary never changes the verdict
+- `POST /v1/analyze-manifest` for npm `package.json` and PyPI requirements-style manifests
+- malicious fixture corpus for startup hooks, secret exfiltration, and native binary droppers
+- registry package-diff signals for new lifecycle scripts, CLI surface, dependency spikes, and new wheels
+- provenance/source metadata signals for missing integrity, digests, and project links
+- native artifact detection for `.node`, `.so`, `.dll`, `.exe`, `.pyd`, and `.dylib` files
+- E2B declared CLI/bin probes using npm `bin` metadata and Python package command names
+- E2B unique canary values per scan, process snapshots, network classification, and artifact summaries
 - optional E2B detonation when `E2B_API_KEY` is configured
 - optional OpenRouter analyst summary when `OPENROUTER_API_KEY` is configured
 - optional OKX x402 middleware when payment credentials are configured
@@ -58,11 +66,23 @@ Without these values, the service starts in local development mode and leaves th
 ENABLE_E2B=true
 E2B_API_KEY=e2b_...
 E2B_ALLOW_INTERNET_ACCESS=true
+E2B_INSTALL_STRACE=true
 E2B_TEMPLATE=
 E2B_TIMEOUT_SECONDS=90
 ```
 
 Keep `ENABLE_E2B=false` for cheap local static/intelligence testing.
+
+## Live core checks
+
+With `E2B_API_KEY` and `OPENROUTER_API_KEY` set in the shell:
+
+```powershell
+uv run python scripts/live_core_check.py
+```
+
+The script exercises safe npm/PyPI packages, a typosquat case, and a missing package case
+with caching disabled.
 
 ## Example
 

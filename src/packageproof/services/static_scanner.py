@@ -14,9 +14,11 @@ SUSPICIOUS_PATTERNS = {
         r"\.ssh/id_rsa",
         r"\.aws/credentials",
         r"application_default_credentials\.json",
-        r"process\.env",
-        r"os\.environ",
-        r"getenv\s*\(",
+        r"OPENAI_API_KEY",
+        r"AWS_SECRET_ACCESS_KEY",
+        r"NPM_TOKEN",
+        r"GH_TOKEN",
+        r"GITHUB_TOKEN",
     ],
     "install_script_abuse": [
         r"\bpreinstall\b",
@@ -80,6 +82,7 @@ class StaticScanner:
                     "type": "install_script",
                     "severity": self._install_script_severity(command),
                     "file": "package.json",
+                    "phase": "install",
                     "detail": f"npm lifecycle script {name}: {command}",
                 }
             )
@@ -87,11 +90,26 @@ class StaticScanner:
                 path=f"package.json:scripts.{name}",
                 content=str(command),
                 findings=findings,
+                phase="install",
             )
 
         for path, content in archive.files.items():
             self._scan_file(path, content, findings)
+        for binary in archive.binary_files:
+            findings.append(
+                {
+                    "type": "native_binary",
+                    "severity": self._binary_severity(binary),
+                    "file": binary.get("path", ""),
+                    "phase": "runtime",
+                    "detail": (
+                        f"native/binary artifact present: {binary.get('type')} "
+                        f"({binary.get('size')} bytes)"
+                    ),
+                }
+            )
 
+        self._apply_package_context(request, findings)
         findings = self._dedupe_findings(findings)
         behavior_chain = self._behavior_chain(findings)
         attack_types = sorted({finding["type"] for finding in findings})
@@ -99,6 +117,7 @@ class StaticScanner:
             "files_scanned": len(archive.files),
             "archive_truncated": archive.truncated,
             "archive_errors": archive.errors,
+            "binary_files": archive.binary_files[:100],
             "findings": findings[:100],
             "attack_type_candidates": attack_types,
             "behavior_chain": behavior_chain,
@@ -114,15 +133,17 @@ class StaticScanner:
                     "type": "install_script_abuse",
                     "severity": "high",
                     "file": path,
+                    "phase": "install",
                     "detail": "Python startup execution hook present",
                 }
             )
         if basename == "setup.py":
             findings.append(
                 {
-                    "type": "install_script_abuse",
-                    "severity": "medium",
+                    "type": "install_script",
+                    "severity": "low",
                     "file": path,
+                    "phase": "install",
                     "detail": "setup.py can execute during build or install",
                 }
             )
@@ -132,25 +153,38 @@ class StaticScanner:
             findings.append(
                 {
                     "type": "obfuscation",
-                    "severity": "medium",
+                    "severity": self._contextual_severity(path, "medium"),
                     "file": path,
+                    "phase": self._phase_for_path(path),
                     "detail": f"high entropy text content ({entropy:.2f})",
                 }
             )
 
-        self._scan_text(path, content, findings)
+        self._scan_text(path, content, findings, phase=self._phase_for_path(path))
 
-    def _scan_text(self, path: str, content: str, findings: list[dict[str, Any]]) -> None:
+    def _scan_text(
+        self,
+        path: str,
+        content: str,
+        findings: list[dict[str, Any]],
+        phase: str,
+    ) -> None:
         for attack_type, patterns in SUSPICIOUS_PATTERNS.items():
             for pattern in patterns:
+                if self._should_skip_pattern(path, attack_type):
+                    continue
                 match = re.search(pattern, content, flags=re.IGNORECASE)
                 if match is None:
                     continue
                 findings.append(
                     {
                         "type": attack_type,
-                        "severity": self._severity_for(attack_type),
+                        "severity": self._contextual_severity(
+                            path,
+                            self._severity_for(attack_type),
+                        ),
                         "file": path,
+                        "phase": phase,
                         "detail": f"matched suspicious pattern: {pattern}",
                         "snippet": self._snippet(content, match.start(), match.end()),
                     }
@@ -166,6 +200,58 @@ class StaticScanner:
         if attack_type in {"credential_stealer", "crypto_drainer", "network_exfiltration"}:
             return "high"
         return "medium"
+
+    @staticmethod
+    def _binary_severity(binary: dict[str, Any]) -> str:
+        path = str(binary.get("path", "")).lower()
+        if any(fragment in path for fragment in ("/test", "/tests", "/docs", "/examples")):
+            return "low"
+        return "high"
+
+    @staticmethod
+    def _phase_for_path(path: str) -> str:
+        normalized = path.lower()
+        basename = normalized.rsplit("/", maxsplit=1)[-1]
+        if basename in {"setup.py", "sitecustomize.py", "usercustomize.py"}:
+            return "install"
+        if basename.endswith(".pth"):
+            return "install"
+        return "runtime"
+
+    @staticmethod
+    def _contextual_severity(path: str, severity: str) -> str:
+        normalized = path.lower()
+        low_signal_fragments = ("/test", "/tests", "/docs", "/doc", "/example", "/examples")
+        if any(fragment in normalized for fragment in low_signal_fragments):
+            return "low"
+        return severity
+
+    @staticmethod
+    def _should_skip_pattern(path: str, attack_type: str) -> bool:
+        basename = path.lower().rsplit("/", maxsplit=1)[-1]
+        metadata_files = {"sources.txt", "record", "metadata", "pkg-info"}
+        return attack_type == "install_script_abuse" and basename in metadata_files
+
+    @staticmethod
+    def _apply_package_context(
+        request: AnalyzePackageRequest,
+        findings: list[dict[str, Any]],
+    ) -> None:
+        network_client_packages = {
+            "npm": {"axios", "got", "node-fetch", "request", "undici"},
+            "pypi": {"aiohttp", "httpx", "requests", "urllib3"},
+        }
+        package_name = request.package.lower().replace("_", "-")
+        if package_name not in network_client_packages[request.ecosystem]:
+            return
+
+        for finding in findings:
+            if finding.get("type") != "network_exfiltration":
+                continue
+            if finding.get("phase") == "install":
+                continue
+            finding["severity"] = "low"
+            finding["detail"] = f"{finding['detail']} (network-client package context)"
 
     @staticmethod
     def _entropy(content: str) -> float:
@@ -199,60 +285,93 @@ class StaticScanner:
 
     @staticmethod
     def _behavior_chain(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        types = {finding["type"] for finding in findings}
+        types_by_file: dict[str, set[str]] = {}
+        phases_by_file: dict[str, set[str]] = {}
+        for finding in findings:
+            file = str(finding.get("file", ""))
+            types_by_file.setdefault(file, set()).add(str(finding.get("type")))
+            phases_by_file.setdefault(file, set()).add(str(finding.get("phase", "runtime")))
+
         chains: list[dict[str, Any]] = []
-        if {"install_script_abuse", "credential_stealer"} <= types:
+        install_secret_files = [
+            file
+            for file, file_types in types_by_file.items()
+            if "install" in phases_by_file.get(file, set())
+            and file_types & {"install_script", "install_script_abuse"}
+            and "credential_stealer" in file_types
+        ]
+        if install_secret_files:
             chains.append(
                 {
                     "type": "install_time_secret_access",
                     "severity": "critical",
-                    "events": ["install_script_abuse", "credential_stealer"],
+                    "events": install_secret_files,
                 }
             )
-        if {"install_script_abuse", "network_exfiltration"} <= types:
+        install_network_files = [
+            file
+            for file, file_types in types_by_file.items()
+            if "install" in phases_by_file.get(file, set())
+            and file_types & {"install_script", "install_script_abuse"}
+            and "network_exfiltration" in file_types
+        ]
+        if install_network_files:
             chains.append(
                 {
                     "type": "install_time_network_behavior",
                     "severity": "critical",
-                    "events": ["install_script_abuse", "network_exfiltration"],
+                    "events": install_network_files,
                 }
             )
-        if {"credential_stealer", "network_exfiltration"} <= types:
+        exfil_files = [
+            file
+            for file, file_types in types_by_file.items()
+            if {"credential_stealer", "network_exfiltration"} <= file_types
+        ]
+        if exfil_files:
             chains.append(
                 {
                     "type": "possible_secret_exfiltration",
                     "severity": "critical",
-                    "events": ["credential_stealer", "network_exfiltration"],
+                    "events": exfil_files,
                 }
             )
         return chains
 
     @staticmethod
     def _install_script_risks(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        script_files = {
-            str(finding["file"])
-            for finding in findings
-            if finding["type"] in {"install_script", "install_script_abuse"}
-        }
-        if not script_files:
-            return []
+        types_by_file: dict[str, set[str]] = {}
+        for finding in findings:
+            file = str(finding.get("file", ""))
+            types_by_file.setdefault(file, set()).add(str(finding.get("type")))
 
-        types = {finding["type"] for finding in findings}
         chains: list[dict[str, Any]] = []
-        if "network_exfiltration" in types:
+        script_network_files = [
+            file
+            for file, types in types_by_file.items()
+            if types & {"install_script", "install_script_abuse"}
+            and "network_exfiltration" in types
+        ]
+        if script_network_files:
             chains.append(
                 {
                     "type": "install_script_network_access",
                     "severity": "critical",
-                    "events": sorted(script_files) + ["network_exfiltration"],
+                    "events": sorted(script_network_files),
                 }
             )
-        if "process_execution" in types:
+        script_exec_files = [
+            file
+            for file, types in types_by_file.items()
+            if types & {"install_script", "install_script_abuse"}
+            and "process_execution" in types
+        ]
+        if script_exec_files:
             chains.append(
                 {
                     "type": "install_script_process_execution",
                     "severity": "high",
-                    "events": sorted(script_files) + ["process_execution"],
+                    "events": sorted(script_exec_files),
                 }
             )
         return chains

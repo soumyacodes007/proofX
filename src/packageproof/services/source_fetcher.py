@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tarfile
 import zipfile
+from pathlib import PurePosixPath
 
 import httpx
 
@@ -24,6 +25,15 @@ TEXT_EXTENSIONS = {
     ".txt",
     ".yaml",
     ".yml",
+}
+
+BINARY_EXTENSIONS = {
+    ".dll",
+    ".dylib",
+    ".exe",
+    ".node",
+    ".pyd",
+    ".so",
 }
 
 
@@ -69,6 +79,16 @@ class SourceFetcher:
                         break
                     if not member.isfile():
                         continue
+                    suffix = PurePosixPath(member.name).suffix.lower()
+                    if suffix in BINARY_EXTENSIONS:
+                        archive.binary_files.append(
+                            {
+                                "path": member.name,
+                                "size": member.size,
+                                "type": suffix.removeprefix("."),
+                            }
+                        )
+                        continue
                     if not self._looks_text(member.name):
                         continue
                     extracted = tar.extractfile(member)
@@ -87,7 +107,20 @@ class SourceFetcher:
                     if len(archive.files) >= self.settings.max_static_files:
                         archive.truncated = True
                         break
-                    if name.endswith("/") or not self._looks_text(name):
+                    if name.endswith("/"):
+                        continue
+                    info = zipped.getinfo(name)
+                    suffix = PurePosixPath(name).suffix.lower()
+                    if suffix in BINARY_EXTENSIONS:
+                        archive.binary_files.append(
+                            {
+                                "path": name,
+                                "size": info.file_size,
+                                "type": suffix.removeprefix("."),
+                            }
+                        )
+                        continue
+                    if not self._looks_text(name):
                         continue
                     archive.files[name] = self._decode_text(zipped.read(name)[:256_000])
         except Exception as exc:
