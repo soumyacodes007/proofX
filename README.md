@@ -85,8 +85,9 @@ Railway provides `PORT` automatically. The Docker command binds Uvicorn to
 
 For a no-cost live demo, set `X402_EXEMPT_PAYERS` to a comma-separated list of
 buyer wallet addresses. Those wallets still must sign the x402 challenge, but
-the server grants access after signature verification without settlement. Leave
-it empty for normal paid production.
+the server grants access after signature verification without settlement. Empty
+defaults to the owner demo wallet; set `X402_EXEMPT_PAYERS=none` for fully paid
+production.
 
 ## x402 payment config
 

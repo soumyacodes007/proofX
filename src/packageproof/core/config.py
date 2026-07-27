@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     okx_passphrase: str = ""
     okx_base_url: str = "https://web3.okx.com"
     analyze_package_price: str = "$0.05"
-    x402_exempt_payers: str = "0x3a2daf805449362147809cf600f6789b0f66e604"
+    x402_exempt_payers: str = ""
 
     e2b_api_key: str = ""
     enable_e2b: bool = False
@@ -52,9 +52,13 @@ class Settings(BaseSettings):
 
     @property
     def x402_exempt_payer_list(self) -> list[str]:
+        default_demo_payer = "0x3a2daf805449362147809cf600f6789b0f66e604"
+        if self.x402_exempt_payers.strip().lower() in {"none", "false", "disabled"}:
+            return []
+        raw_payers = self.x402_exempt_payers.strip() or default_demo_payer
         return [
             payer.strip()
-            for payer in self.x402_exempt_payers.split(",")
+            for payer in raw_payers.split(",")
             if payer.strip()
         ]
 
