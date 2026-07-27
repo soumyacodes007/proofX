@@ -42,6 +42,47 @@ uv run uvicorn packageproof.main:app --reload
 
 Open `http://127.0.0.1:8000/health`.
 
+## Deploy on Railway
+
+This repository is Railway-ready with `Dockerfile` and `railway.json`.
+
+1. Create a new Railway project from the GitHub repo.
+2. Set the Railway service variables from `.env.example`.
+3. Deploy the service.
+4. Confirm the health check:
+
+```text
+https://<your-railway-domain>/health
+```
+
+5. Register this paid A2MCP endpoint with OKX.AI:
+
+```text
+https://<your-railway-domain>/v1/analyze-package
+```
+
+Required production variables:
+
+```env
+ENVIRONMENT=production
+DATABASE_URL=sqlite:////app/data/packageproof.db
+X402_ENABLED=true
+NETWORK=eip155:196
+PAY_TO_ADDRESS=0x...
+OKX_API_KEY=...
+OKX_SECRET_KEY=...
+OKX_PASSPHRASE=...
+OKX_BASE_URL=https://web3.okx.com
+ANALYZE_PACKAGE_PRICE=$0.05
+ENABLE_E2B=true
+E2B_API_KEY=e2b_...
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=openai/gpt-4.1-mini
+```
+
+Railway provides `PORT` automatically. The Docker command binds Uvicorn to
+`0.0.0.0:${PORT}`.
+
 ## x402 payment config
 
 For OKX.AI production registration, set:
@@ -83,6 +124,20 @@ uv run python scripts/live_core_check.py
 
 The script exercises safe npm/PyPI packages, a typosquat case, and a missing package case
 with caching disabled.
+
+## Live paid x402 check
+
+Start the API with `X402_ENABLED=true`, then provide a funded buyer key only in your
+local shell or `.env`:
+
+```powershell
+$env:X402_BUYER_PRIVATE_KEY="0x..."
+uv run python scripts/live_x402_paid_check.py --url http://127.0.0.1:8001/v1/analyze-package
+```
+
+The script uses the official Python x402 client to handle the unpaid `402` challenge,
+sign the payment payload, retry the request, and print the final report metadata. It
+does not print the buyer key.
 
 ## Example
 
