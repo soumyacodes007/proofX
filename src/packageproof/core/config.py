@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     okx_passphrase: str = ""
     okx_base_url: str = "https://web3.okx.com"
     analyze_package_price: str = "$0.05"
+    x402_exempt_payers: str = "0x3a2daf805449362147809cf600f6789b0f66e604"
 
     e2b_api_key: str = ""
     enable_e2b: bool = False
@@ -48,6 +49,14 @@ class Settings(BaseSettings):
                 self.okx_passphrase,
             ]
         )
+
+    @property
+    def x402_exempt_payer_list(self) -> list[str]:
+        return [
+            payer.strip()
+            for payer in self.x402_exempt_payers.split(",")
+            if payer.strip()
+        ]
 
     @cached_property
     def sqlite_path(self) -> Path:

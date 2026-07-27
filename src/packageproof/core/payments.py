@@ -62,5 +62,13 @@ def configure_x402_payments(app: FastAPI, settings: Settings) -> None:
             mime_type="application/json",
         )
     }
-    app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
+    exempt_payers = settings.x402_exempt_payer_list
+    app.add_middleware(
+        PaymentMiddlewareASGI,
+        routes=routes,
+        server=server,
+        exempt_payers=exempt_payers or None,
+    )
+    if exempt_payers:
+        logger.info("x402 middleware enabled with %s exempt payer(s)", len(exempt_payers))
     logger.info("x402 middleware enabled for POST /v1/analyze-package")

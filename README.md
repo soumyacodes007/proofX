@@ -83,6 +83,11 @@ OPENROUTER_MODEL=openai/gpt-4.1-mini
 Railway provides `PORT` automatically. The Docker command binds Uvicorn to
 `0.0.0.0:${PORT}`.
 
+For a no-cost live demo, set `X402_EXEMPT_PAYERS` to a comma-separated list of
+buyer wallet addresses. Those wallets still must sign the x402 challenge, but
+the server grants access after signature verification without settlement. Leave
+it empty for normal paid production.
+
 ## x402 payment config
 
 For OKX.AI production registration, set:
